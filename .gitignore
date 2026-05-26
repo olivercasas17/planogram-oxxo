@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node
+node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+
+data/samples/
