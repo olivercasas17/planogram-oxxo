@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 from pydantic import BaseModel
@@ -91,7 +91,22 @@ def validate_csv(content: bytes) -> pd.DataFrame:
 # Modelos Pydantic para la API
 # ---------------------------------------------------------------------------
 
+class Configuracion(BaseModel):
+    """Una combinación única de filtros detectada en el CSV subido."""
+    segmento_id: str
+    mueble_id: str
+    tamaño_post: float
+    direccion_lego_id: str
+
+
+class UploadResponse(BaseModel):
+    file_id: str
+    filename: str
+    configuraciones: list[Configuracion]
+
+
 class OptimizeRequest(BaseModel):
+    file_id: str
     segmento_id: str
     mueble_id: str
     tamaño: float
@@ -99,9 +114,26 @@ class OptimizeRequest(BaseModel):
 
 
 class OptimizeResponse(BaseModel):
-    solver: str
-    score: float
-    total_planogrupos: int
-    asignados: int
-    sin_asignar: int
-    results: list[dict[str, Any]]
+    job_id: str
+    status: str
+
+
+class PlanogrupoResult(BaseModel):
+    planogrupo: str
+    charola: int
+    ubicacion_bandeja: int
+    ancho_usado_cm: float
+
+
+JobStatus = Literal["pending", "running", "done", "error"]
+
+
+class JobResult(BaseModel):
+    job_id: str
+    status: JobStatus
+    solver: str | None = None
+    score: float | None = None
+    total_planogrupos: int | None = None
+    asignados: int | None = None
+    sin_asignar: int | None = None
+    results: list[PlanogrupoResult] | None = None

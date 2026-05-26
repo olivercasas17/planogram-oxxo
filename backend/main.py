@@ -20,8 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(optimize.router)
-app.include_router(upload.router)
+app.include_router(upload.router, prefix="/api")
+app.include_router(optimize.router, prefix="/api")
 
 
 @app.get("/health")
