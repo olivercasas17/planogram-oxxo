@@ -1,0 +1,23 @@
+meta {
+  name: Ver Resultado
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/optimize/result/{{job_id}}
+  body: none
+  auth: none
+}
+
+script:post-response {
+  if (res.status === 200) {
+    const job = res.body;
+    console.log("Status:", job.status);
+    if (job.status === "done") {
+      console.log("Solver:", job.solver);
+      console.log("Score:", job.score);
+      console.log("Asignados:", job.asignados, "/", job.total_planogrupos);
+    }
+  }
+}

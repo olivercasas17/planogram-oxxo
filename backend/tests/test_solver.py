@@ -1,144 +1,282 @@
-import io
+"""
+Tests unitarios del algoritmo heurístico (solver/algoritmo.py).
+
+Cubre:
+  - Contrato del DataFrame de salida (columnas, tipos, attrs)
+  - Restricción de ancho por charola (≤ 55 cm)
+  - Sin posiciones duplicadas (c, j) por grupo
+  - Fase 2 repara sobrecupo correctamente
+  - Productos no colocados marcados con FLAG_NO_COLOCADO=True
+  - Validación post-heurístico con la función validar()
+"""
+
 import pathlib
+
+import numpy as np
 import pandas as pd
 import pytest
-from solver.toy_solver import toy_solve
-from solver.schemas import (
-    REQUIRED_COLUMNS,
-    MissingColumnsError,
-    validate_csv,
+
+from solver.algoritmo import (
+    ANCHO_CHAROLA_CM,
+    COLS_FORMATO,
+    planogramar_heuristico,
+    validar,
 )
+from solver.schemas import REQUIRED_COLUMNS, MissingColumnsError, validate_csv
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_grupo(n_productos: int, ancho: float, tamano_post: float = 3.0,
+                direccion: str = "DI", segmento: str = "BCO") -> pd.DataFrame:
+    """
+    Crea un DataFrame de un único formato con n_productos.
+    Los históricos (CHAROLA, UBICACION_BANDEJA) se distribuyen 1 producto por slot,
+    empezando en charola 1, posición 1..n_productos.
+    Cada producto tiene ancho `ancho` cm (NUM_FRENTES=1, SEPARADOR=0).
+    """
+    rows = []
+    for i in range(n_productos):
+        rows.append({
+            "SEGMENTO_ID":       segmento,
+            "MUEBLE_ID":         "CF",
+            "PLANOGRUPO":        "PG-Test",
+            "TAMANO_POST":       tamano_post,
+            "DIRECCION_LEGO_ID": direccion,
+            "CONJUNTO_ID":       "TST",
+            "CHAROLA":           1,           # todos quieren ir a charola 1
+            "UBICACION_BANDEJA": i + 1,
+            "NUM_FRENTES":       1,
+            "ANCHO":             ancho,
+            "ALTO":              25.0,
+            "SEPARADOR":         0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _make_multicharola(n_charolas: int, productos_por_charola: int,
+                       ancho: float, tamano_post: float = 3.0) -> pd.DataFrame:
+    """Crea un formato con productos distribuidos en n_charolas charolas."""
+    rows = []
+    for c in range(1, n_charolas + 1):
+        for j in range(1, productos_por_charola + 1):
+            rows.append({
+                "SEGMENTO_ID":       "BCO",
+                "MUEBLE_ID":         "CF",
+                "PLANOGRUPO":        "PG-Multi",
+                "TAMANO_POST":       tamano_post,
+                "DIRECCION_LEGO_ID": "DI",
+                "CONJUNTO_ID":       "TST",
+                "CHAROLA":           c,
+                "UBICACION_BANDEJA": j,
+                "NUM_FRENTES":       1,
+                "ANCHO":             ancho,
+                "ALTO":              25.0,
+                "SEPARADOR":         0,
+            })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_df(rows: list[dict]) -> pd.DataFrame:
-    """Construye un DataFrame con las columnas que espera toy_solve."""
-    return pd.DataFrame(rows)
+@pytest.fixture(scope="module")
+def df_real():
+    csv_path = pathlib.Path(__file__).parents[2] / "data" / "samples" / "ejemplo_planograma.csv"
+    assert csv_path.exists(), f"CSV de muestra no encontrado: {csv_path}"
+    return validate_csv(csv_path.read_bytes())
 
 
-@pytest.fixture
-def df_basico():
-    """Dos planogrupos que caben holgadamente en una sola charola."""
-    return _make_df([
-        {
-            "SEGMENTO_ID": "SEG1", "MUEBLE_ID": "MUE1",
-            "TAMAÑO_POST": 1.0, "DIRECCION_LEGO_ID": "IZQ",
-            "CHAROLA": 1, "Width": 200.0, "Height": 50.0,
-            "PLANOGRUPO": "PG-A", "ANCHO": 30.0, "ALTO": 20.0,
-        },
-        {
-            "SEGMENTO_ID": "SEG1", "MUEBLE_ID": "MUE1",
-            "TAMAÑO_POST": 1.0, "DIRECCION_LEGO_ID": "IZQ",
-            "CHAROLA": 1, "Width": 200.0, "Height": 50.0,
-            "PLANOGRUPO": "PG-B", "ANCHO": 40.0, "ALTO": 15.0,
-        },
-    ])
-
-
-@pytest.fixture
-def df_sin_espacio():
-    """Planogrupo cuyo ancho supera la capacidad de todas las charolas."""
-    return _make_df([
-        {
-            "SEGMENTO_ID": "SEG1", "MUEBLE_ID": "MUE1",
-            "TAMAÑO_POST": 1.0, "DIRECCION_LEGO_ID": "IZQ",
-            "CHAROLA": 1, "Width": 10.0, "Height": 50.0,
-            "PLANOGRUPO": "PG-GRANDE", "ANCHO": 999.0, "ALTO": 20.0,
-        },
-    ])
-
-
-@pytest.fixture
-def df_altura_incompatible():
-    """Planogrupo más alto que la charola disponible."""
-    return _make_df([
-        {
-            "SEGMENTO_ID": "SEG1", "MUEBLE_ID": "MUE1",
-            "TAMAÑO_POST": 1.0, "DIRECCION_LEGO_ID": "IZQ",
-            "CHAROLA": 1, "Width": 200.0, "Height": 10.0,
-            "PLANOGRUPO": "PG-ALTO", "ANCHO": 30.0, "ALTO": 50.0,
-        },
-    ])
+@pytest.fixture(scope="module")
+def resultado_real(df_real):
+    return planogramar_heuristico(df_real)
 
 
 # ---------------------------------------------------------------------------
-# Contrato de la respuesta
+# Contrato de salida (DataFrame)
 # ---------------------------------------------------------------------------
 
-class TestContrato:
-    """El dict devuelto siempre debe tener las claves del contrato."""
+class TestContratoSalida:
 
-    def test_claves_top_level(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert "solver" in out
-        assert "score" in out
-        assert "results" in out
+    def test_devuelve_dataframe(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        assert isinstance(out, pd.DataFrame)
 
-    def test_solver_flag(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["solver"] == "toy_greedy_v1"
+    def test_columnas_obligatorias_presentes(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        for col in ("CHAROLA", "UBICACION_BANDEJA", "ANCHO_OCUPADO_CM",
+                    "X_INICIO_CM", "X_FIN_CM", "FLAG_NO_COLOCADO"):
+            assert col in out.columns, f"Falta columna: {col}"
 
-    def test_score_rango(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert 0.0 <= out["score"] <= 1.0
+    def test_attrs_score_presente(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        assert "Score" in out.attrs
+        assert "Z" in out.attrs
+        assert "Z_H" in out.attrs
 
-    def test_results_es_lista(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert isinstance(out["results"], list)
+    def test_score_entre_0_y_1(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        score = out.attrs["Score"]
+        assert 0.0 <= score <= 1.0, f"Score fuera de rango: {score}"
 
-    def test_items_tienen_claves_requeridas(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        for item in out["results"]:
-            assert "planogrupo" in item
-            assert "charola" in item
-            assert "ubicacion_bandeja" in item
-            assert "ancho_usado_cm" in item
-
-
-# ---------------------------------------------------------------------------
-# Casos funcionales
-# ---------------------------------------------------------------------------
-
-class TestCasosFuncionales:
-
-    def test_asigna_todos_cuando_hay_espacio(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["asignados"] == 2
-        assert out["sin_asignar"] == 0
-        assert out["score"] == 1.0
-
-    def test_sin_asignar_cuando_no_hay_espacio(self, df_sin_espacio):
-        out = toy_solve(df_sin_espacio, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["sin_asignar"] >= 1
-        sin_asignar = [r for r in out["results"] if r["charola"] == -1]
-        assert len(sin_asignar) >= 1
-
-    def test_sin_asignar_por_altura(self, df_altura_incompatible):
-        out = toy_solve(df_altura_incompatible, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["sin_asignar"] == 1
-
-    def test_total_planogrupos_coincide_con_results(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["total_planogrupos"] == len(out["results"])
-
-    def test_asignados_mas_sin_asignar_igual_total(self, df_basico):
-        out = toy_solve(df_basico, "SEG1", "MUE1", 1.0, "IZQ")
-        assert out["asignados"] + out["sin_asignar"] == out["total_planogrupos"]
+    def test_flag_no_colocado_es_bool(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        assert out["FLAG_NO_COLOCADO"].dtype == bool or \
+               set(out["FLAG_NO_COLOCADO"].unique()).issubset({True, False})
 
 
 # ---------------------------------------------------------------------------
-# Combinación sin datos
+# Restricción de ancho (≤ 55 cm) — BUG CRÍTICO REPORTADO
 # ---------------------------------------------------------------------------
 
-class TestSinDatos:
+class TestRestriccionAncho:
 
-    def test_combinacion_inexistente_devuelve_error(self, df_basico):
-        out = toy_solve(df_basico, "NOSEG", "NOMUE", 9.9, "DER")
-        assert "error" in out
-        assert out["results"] == []
+    def test_ninguna_charola_excede_ancho_caso_holgado(self):
+        """5 productos de 8 cm → 40 cm total, bien dentro de 55 cm."""
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["charolas_que_exceden_ancho"] == 0
+
+    def test_ninguna_charola_excede_ancho_caso_limite(self):
+        """6 productos de 9 cm → 54 cm, justo por debajo de 55 cm."""
+        df = _make_grupo(6, ancho=9.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["charolas_que_exceden_ancho"] == 0
+
+    def test_fase2_repara_sobrecupo(self):
+        """8 productos de 10 cm en charola 1 → 80 cm > 55 cm.
+        La Fase 2 debe expulsar productos hasta que ancho ≤ 55 cm."""
+        df = _make_grupo(8, ancho=10.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["charolas_que_exceden_ancho"] == 0, \
+            f"Fase 2 no reparó: {v['charolas_que_exceden_ancho']} charola(s) exceden"
+
+    def test_expulsados_marcados_no_colocados(self):
+        """Los productos que no caben deben llevar FLAG_NO_COLOCADO=True."""
+        # 8 × 10 cm = 80 cm en 1 charola → al menos 2 no caben (55 cm / 10 = 5.5 → max 5)
+        df = _make_grupo(8, ancho=10.0)
+        out = planogramar_heuristico(df)
+        no_col = out["FLAG_NO_COLOCADO"].sum()
+        assert no_col >= 2, f"Se esperaban ≥2 no colocados, hubo {no_col}"
+
+    def test_ancho_por_charola_valido_en_multicharola(self):
+        """3 charolas × 5 productos de 9 cm → 45 cm por charola, deben caber."""
+        df = _make_multicharola(n_charolas=3, productos_por_charola=5, ancho=9.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["charolas_que_exceden_ancho"] == 0
+
+    def test_ancho_por_charola_no_excede_con_csv_real(self, resultado_real):
+        v = validar(resultado_real)
+        assert v["charolas_que_exceden_ancho"] == 0, \
+            f"CSV real: {v['charolas_que_exceden_ancho']} charola(s) exceden 55 cm"
+
+
+# ---------------------------------------------------------------------------
+# Posiciones duplicadas — BUG CRÍTICO REPORTADO
+# ---------------------------------------------------------------------------
+
+class TestSinDuplicados:
+
+    def test_sin_posiciones_duplicadas_caso_simple(self):
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["posiciones_duplicadas"] == 0
+
+    def test_sin_posiciones_duplicadas_sobrecupo(self):
+        """Incluso cuando la Fase 2 expulsa productos no deben quedar duplicados."""
+        df = _make_grupo(8, ancho=10.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["posiciones_duplicadas"] == 0
+
+    def test_sin_posiciones_duplicadas_multicharola(self):
+        df = _make_multicharola(n_charolas=3, productos_por_charola=4, ancho=8.0)
+        out = planogramar_heuristico(df)
+        v = validar(out)
+        assert v["posiciones_duplicadas"] == 0
+
+    def test_sin_posiciones_duplicadas_csv_real(self, resultado_real):
+        v = validar(resultado_real)
+        assert v["posiciones_duplicadas"] == 0, \
+            f"CSV real: {v['posiciones_duplicadas']} posicion(es) duplicada(s)"
+
+
+# ---------------------------------------------------------------------------
+# Productos no colocados
+# ---------------------------------------------------------------------------
+
+class TestNoColocados:
+
+    def test_todos_colocados_cuando_hay_espacio(self):
+        """5 productos de 8 cm → 40 cm < 55 cm; todos deben colocarse."""
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        assert out["FLAG_NO_COLOCADO"].sum() == 0
+
+    def test_hay_no_colocados_cuando_no_hay_espacio(self):
+        """8 productos de 10 cm en una charola de 55 cm → máx. 5 caben."""
+        df = _make_grupo(8, ancho=10.0)
+        out = planogramar_heuristico(df)
+        assert out["FLAG_NO_COLOCADO"].sum() >= 1
+
+    def test_no_colocados_no_tienen_charola(self):
+        """Productos con FLAG_NO_COLOCADO=True deben tener CHAROLA=NaN."""
+        df = _make_grupo(8, ancho=10.0)
+        out = planogramar_heuristico(df)
+        no_col = out[out["FLAG_NO_COLOCADO"] == True]
+        assert no_col["CHAROLA"].isna().all(), \
+            "Productos no colocados tienen CHAROLA asignada"
+
+    def test_colocados_tienen_charola_entera(self):
+        """Productos colocados deben tener CHAROLA como entero válido."""
+        df = _make_grupo(5, ancho=8.0)
+        out = planogramar_heuristico(df)
+        col = out[out["FLAG_NO_COLOCADO"] == False]
+        assert col["CHAROLA"].notna().all()
+        assert (col["CHAROLA"] >= 1).all()
+
+
+# ---------------------------------------------------------------------------
+# Score Z
+# ---------------------------------------------------------------------------
+
+class TestScoreZ:
+
+    def test_score_1_cuando_todos_en_posicion_historica(self):
+        """Con factor_ancho=1.0 y datos holgados, todos van a su posición histórica."""
+        df = _make_multicharola(n_charolas=3, productos_por_charola=3, ancho=8.0)
+        out = planogramar_heuristico(df, factor_ancho=1.0)
+        assert out.attrs["Score"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_score_decrece_con_estres(self):
+        """factor_ancho > 1 fuerza reparaciones → Score debe bajar."""
+        df = _make_multicharola(n_charolas=2, productos_por_charola=4, ancho=7.0)
+        s_normal = planogramar_heuristico(df, factor_ancho=1.0).attrs["Score"]
+        s_estres = planogramar_heuristico(df, factor_ancho=2.0).attrs["Score"]
+        assert s_estres <= s_normal
+
+    def test_z_equal_zh_cuando_score_1(self):
+        df = _make_multicharola(n_charolas=2, productos_por_charola=3, ancho=8.0)
+        out = planogramar_heuristico(df, factor_ancho=1.0)
+        assert out.attrs["Z"] == out.attrs["Z_H"]
+
+    def test_csv_real_score_alto(self, resultado_real):
+        """El CSV real en modo imitación (factor_ancho=1.0) debe tener Score≈1."""
+        score = resultado_real.attrs["Score"]
+        assert score >= 0.95, f"Score bajo en CSV real: {score:.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -146,18 +284,19 @@ class TestSinDatos:
 # ---------------------------------------------------------------------------
 
 def _csv_bytes(df: pd.DataFrame) -> bytes:
-    """Serializa el DataFrame a bytes UTF-8 (sin BOM), que es lo que validate_csv espera."""
     return df.to_csv(index=False).encode("utf-8")
 
 
 def _full_row(**overrides) -> dict:
-    """Fila con todas las columnas requeridas; sobreescribe con kwargs."""
     base = {
-        "SEGMENTO_ID": "SEG1", "MUEBLE_ID": "MUE1", "PLANOGRUPO": "PG-A",
-        "TAMAÑO_POST": 1.0, "DIRECCION_LEGO_ID": "IZQ",
-        "CHAROLA": 1, "UBICACION_BANDEJA": 1,
-        "ANCHO": 30.0, "ALTO": 20.0,
-        "Width": 200.0, "Height": 50.0,
+        "MUEBLE_ID":         "CF",
+        "PLANOGRUPO":        "PG-A",
+        "CHAROLA":           1,
+        "UBICACION_BANDEJA": 1,
+        "ANCHO":             10.0,
+        "ALTO":              25.0,
+        "NUM_FRENTES":       1,
+        "TAMANO_POST":       3.0,
     }
     base.update(overrides)
     return base
@@ -177,6 +316,12 @@ class TestValidateCsv:
         for col in REQUIRED_COLUMNS:
             assert col in result.columns
 
+    def test_columnas_opcionales_no_requeridas(self):
+        """SEGMENTO_ID, DIRECCION_LEGO_ID, CONJUNTO_ID son opcionales."""
+        df = pd.DataFrame([_full_row()])
+        result = validate_csv(_csv_bytes(df))
+        assert isinstance(result, pd.DataFrame)
+
     def test_columnas_extra_permitidas(self):
         df = pd.DataFrame([_full_row(EXTRA_COL="valor")])
         result = validate_csv(_csv_bytes(df))
@@ -191,15 +336,15 @@ class TestValidateCsv:
 
     def test_faltan_varias_columnas_lista_completa(self):
         df = pd.DataFrame([_full_row()])
-        df = df.drop(columns=["ANCHO", "ALTO", "Width"])
+        df = df.drop(columns=["ANCHO", "ALTO"])
         with pytest.raises(MissingColumnsError) as exc_info:
             validate_csv(_csv_bytes(df))
-        assert set(exc_info.value.missing) == {"ANCHO", "ALTO", "Width"}
+        assert set(exc_info.value.missing) == {"ANCHO", "ALTO"}
 
     def test_error_menciona_columnas_faltantes_en_mensaje(self):
         df = pd.DataFrame([_full_row()])
-        df = df.drop(columns=["SEGMENTO_ID"])
-        with pytest.raises(MissingColumnsError, match="SEGMENTO_ID"):
+        df = df.drop(columns=["MUEBLE_ID"])
+        with pytest.raises(MissingColumnsError, match="MUEBLE_ID"):
             validate_csv(_csv_bytes(df))
 
     def test_csv_vacio_con_headers_validos_retorna_df_vacio(self):
@@ -208,135 +353,17 @@ class TestValidateCsv:
         assert len(result) == 0
 
     def test_archivo_vacio_lanza_valueerror(self):
-        # pandas lanza EmptyDataError con latin1 y archivo vacío
-        with pytest.raises(ValueError, match="No se pudo leer"):
+        with pytest.raises(ValueError):
             validate_csv(b"")
 
     def test_acentos_en_datos_no_rompen_lectura(self):
-        """Caracteres con acento en valores de datos deben preservarse (UTF-8)."""
         df = pd.DataFrame([_full_row(PLANOGRUPO="Refresco Área")])
         result = validate_csv(_csv_bytes(df))
         assert result["PLANOGRUPO"].iloc[0] == "Refresco Área"
 
     def test_bom_utf8_se_elimina(self):
-        """Un archivo con BOM UTF-8 debe leerse igual que sin BOM."""
         bom = b"\xef\xbb\xbf"
         df = pd.DataFrame([_full_row()])
-        sin_bom = _csv_bytes(df)
-        result = validate_csv(bom + sin_bom)
+        result = validate_csv(bom + _csv_bytes(df))
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 1
-
-
-# ---------------------------------------------------------------------------
-# Fixture: archivo CSV real de OXXO
-# ---------------------------------------------------------------------------
-
-_SAMPLES_DIR = pathlib.Path(__file__).parents[2] / "data" / "samples"
-_CSV_PATH = _SAMPLES_DIR / "ejemplo_planograma.csv"
-
-
-@pytest.fixture(scope="module")
-def df_planograma():
-    """DataFrame cargado desde el archivo CSV real de OXXO."""
-    assert _CSV_PATH.exists(), (
-        f"Archivo de muestra no encontrado: {_CSV_PATH}\n"
-        "Coloca 'ejemplo_planograma.csv' en data/samples/ antes de correr estos tests."
-    )
-    content = _CSV_PATH.read_bytes()
-    return validate_csv(content)
-
-
-# ---------------------------------------------------------------------------
-# Tests con el CSV real
-# ---------------------------------------------------------------------------
-
-class TestToyConCsvReal:
-    """
-    Usa data/samples/ejemplo_planograma.csv como fixture.
-    Combos válidos presentes en el archivo: (BCO|CLA|HRN, CF, [3.0..5.0], DI|ID).
-    """
-
-    # ---- contrato de respuesta ----
-
-    def test_devuelve_dict(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert isinstance(out, dict)
-
-    def test_llave_solver_presente(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert "solver" in out
-
-    def test_llave_score_presente(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert "score" in out
-
-    def test_llave_results_presente(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert "results" in out
-
-    def test_results_es_lista_no_vacia(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert isinstance(out["results"], list)
-        assert len(out["results"]) > 0
-
-    # ---- claves en cada resultado ----
-
-    def test_cada_resultado_tiene_charola(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert "charola" in item, f"Falta 'charola' en: {item}"
-
-    def test_cada_resultado_tiene_ubicacion_bandeja(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert "ubicacion_bandeja" in item, f"Falta 'ubicacion_bandeja' en: {item}"
-
-    def test_cada_resultado_tiene_planogrupo(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert "planogrupo" in item
-
-    def test_cada_resultado_tiene_ancho_usado_cm(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert "ancho_usado_cm" in item
-
-    # ---- integridad numérica ----
-
-    def test_score_entre_0_y_1(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert 0.0 <= out["score"] <= 1.0
-
-    def test_totales_consistentes(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        assert out["asignados"] + out["sin_asignar"] == out["total_planogrupos"]
-        assert out["total_planogrupos"] == len(out["results"])
-
-    def test_charola_es_int(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert isinstance(item["charola"], int)
-
-    def test_ubicacion_bandeja_es_int(self, df_planograma):
-        out = toy_solve(df_planograma, "BCO", "CF", 4.0, "DI")
-        for item in out["results"]:
-            assert isinstance(item["ubicacion_bandeja"], int)
-
-    # ---- variedad de combinaciones ----
-
-    @pytest.mark.parametrize("seg,mue,tam,dir_", [
-        ("BCO", "CF", 4.0, "ID"),
-        ("CLA", "CF", 5.0, "ID"),
-        ("HRN", "CF", 3.0, "DI"),
-    ])
-    def test_otras_combinaciones_validas(self, df_planograma, seg, mue, tam, dir_):
-        out = toy_solve(df_planograma, seg, mue, tam, dir_)
-        assert "solver" in out
-        assert "score" in out
-        assert isinstance(out["results"], list)
-
-    def test_combinacion_inexistente_retorna_error(self, df_planograma):
-        out = toy_solve(df_planograma, "ZZZ", "XX", 9.9, "DI")
-        assert "error" in out
-        assert out["results"] == []

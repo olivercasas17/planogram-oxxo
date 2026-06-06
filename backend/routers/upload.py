@@ -2,13 +2,12 @@ import uuid
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
-from solver.schemas import Configuracion, MissingColumnsError, UploadResponse, validate_csv
+from solver.schemas import MissingColumnsError, UploadResponse, validate_csv
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
 # In-memory store: file_id -> DataFrame
-# Replaced by a real cache/DB in production.
-_file_store: dict[str, tuple[str, pd.DataFrame]] = {}  # file_id -> (filename, df)
+_file_store: dict[str, tuple[str, pd.DataFrame]] = {}
 
 
 def get_dataframe(file_id: str) -> pd.DataFrame:
@@ -17,6 +16,14 @@ def get_dataframe(file_id: str) -> pd.DataFrame:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"file_id '{file_id}' no encontrado")
     return entry[1]
+
+
+def _extract_tiendas(df: pd.DataFrame) -> list[str]:
+    """Extract unique store-type codes from SEGMENTO_ID."""
+    if "SEGMENTO_ID" not in df.columns:
+        return []
+    vals = df["SEGMENTO_ID"].dropna().astype(str).str.strip()
+    return sorted({v for v in vals if v and v.lower() != "nan"})
 
 
 @router.post("", response_model=UploadResponse)
@@ -30,30 +37,16 @@ async def upload_file(file: UploadFile = File(...)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Detect unique filter combinations
-    combo_cols = ["SEGMENTO_ID", "MUEBLE_ID", "TAMAÑO_POST", "DIRECCION_LEGO_ID"]
-    combos = (
-        df[combo_cols]
-        .drop_duplicates()
-        .sort_values(combo_cols)
-        .reset_index(drop=True)
-    )
-
-    configuraciones = [
-        Configuracion(
-            segmento_id=str(row["SEGMENTO_ID"]).strip(),
-            mueble_id=str(row["MUEBLE_ID"]).strip(),
-            tamaño_post=float(row["TAMAÑO_POST"]),
-            direccion_lego_id=str(row["DIRECCION_LEGO_ID"]).strip(),
-        )
-        for _, row in combos.iterrows()
-    ]
-
+    # Usar la columna identificadora disponible (en orden de preferencia)
+    id_col = next((c for c in ("UPC_CVE", "ITEM", "PLANOGRUPO") if c in df.columns), None)
+    total_productos = int(df[id_col].nunique()) if id_col else len(df)
+    tiendas = _extract_tiendas(df)
     file_id = str(uuid.uuid4())
     _file_store[file_id] = (file.filename or "unknown.csv", df)
 
     return UploadResponse(
         file_id=file_id,
         filename=file.filename or "unknown.csv",
-        configuraciones=configuraciones,
+        total_productos=total_productos,
+        tiendas=tiendas,
     )

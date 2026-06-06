@@ -1,0 +1,34 @@
+meta {
+  name: Optimizar
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/optimize
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "file_id": "{{file_id}}",
+    "segmento_id": "BCO",
+    "mueble_id": "CF",
+    "tamaño": 4.0,
+    "direccion": "ID"
+  }
+}
+
+script:post-response {
+  // Guarda el job_id para consultar el resultado
+  if (res.status === 200) {
+    bru.setVar("job_id", res.body.job_id);
+    console.log("job_id capturado:", res.body.job_id);
+    console.log("Status inicial:", res.body.status);
+  }
+}

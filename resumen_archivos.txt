@@ -1,0 +1,201 @@
+RESUMEN DE ARCHIVOS - PLANOGRAM OXXO
+=====================================
+Generado el 2026-06-05
+
+ARQUITECTURA GENERAL
+--------------------
+Aplicación web full-stack para optimización de planogramas (distribución de productos en estantes).
+- Backend: Python 3.11 + FastAPI
+- Frontend: React 18 + TypeScript + Vite + Tailwind CSS
+- Despliegue: Docker + Docker Compose
+- Algoritmo: PuLP (programación lineal)
+
+Flujo de datos:
+  Usuario sube CSV → backend valida y almacena → usuario dispara optimización →
+  tarea de fondo ejecuta algoritmo → frontend hace polling hasta obtener resultado →
+  resultado se muestra en cuadrícula visual
+
+
+=======================
+RAÍZ DEL PROYECTO
+=======================
+
+docker-compose.yml
+  Orquesta los dos contenedores (backend en puerto 8000, frontend en puerto 5173).
+  Define health check del backend antes de iniciar el frontend.
+
+data/samples/ejemplo_planograma.csv
+data/samples/planograma_input.csv
+  Archivos CSV de ejemplo con el formato de entrada esperado por el solver
+  (productos, dimensiones, pesos, categorías, etc.).
+
+Planogram Solver _offline_.html
+  Versión standalone del solver que corre completamente en el navegador, sin backend.
+
+
+=======================
+BACKEND  (/backend/)
+=======================
+
+requirements.txt
+  Dependencias Python: FastAPI, Uvicorn, Pandas, PuLP, Pydantic, pytest, python-multipart.
+
+Dockerfile
+  Imagen basada en python:3.11-slim. Instala dependencias y arranca Uvicorn en el puerto 8000.
+
+main.py
+  Punto de entrada de la aplicación FastAPI.
+  Registra los routers de upload y optimize, configura CORS y expone GET /health.
+
+--- Routers ---
+
+routers/upload.py
+  POST /api/upload
+  Recibe un CSV multipart, lo valida contra las columnas requeridas y lo guarda en
+  un diccionario en memoria. Devuelve un file_id UUID para referencias posteriores.
+
+routers/optimize.py
+  POST /api/optimize          → crea un job en background y devuelve un job_id.
+  GET  /api/optimize/result/{job_id} → consulta el estado/resultado del job (polling).
+  Los jobs se guardan en memoria; el solver se ejecuta en un hilo separado via BackgroundTasks.
+
+--- Solver ---
+
+solver/schemas.py
+  Modelos Pydantic para validación y serialización:
+    - CsvRow, ValidacionCSV: valida columnas y tipos del archivo subido.
+    - UploadResponse: respuesta del endpoint de upload.
+    - ProductoResult: resultado de un producto en el planograma optimizado.
+    - JobResult / OptimizeResponse: resultado completo de un job de optimización.
+  También maneja la detección de encoding (UTF-8 BOM, Latin-1, CP1252).
+
+solver/algoritmo.py
+  Núcleo del sistema. Implementa el algoritmo heurístico/MILP con PuLP para asignar
+  productos a posiciones en estantes, respetando restricciones de espacio, categoría
+  y reglas de negocio de OXXO. Recibe el DataFrame validado y devuelve la lista de
+  ProductoResult con la disposición óptima.
+
+solver/__init__.py
+  Marcador de paquete Python (vacío).
+
+--- Tests ---
+
+tests/test_api.py
+  Tests de integración para los endpoints REST (upload, optimize, polling de resultados).
+  Usa TestClient de FastAPI/Starlette.
+
+tests/test_solver.py
+  Tests unitarios del algoritmo de optimización con datos sintéticos.
+
+tests/__init__.py
+  Marcador de paquete Python (vacío).
+
+
+=======================
+FRONTEND  (/frontend/)
+=======================
+
+package.json
+  Dependencias principales: React 18, Axios (HTTP), html2canvas (exportar imagen).
+  DevDependencies: TypeScript, Vite, Tailwind CSS, ESLint, Prettier.
+
+vite.config.ts
+  Configuración de Vite: plugin de React, proxy de /api hacia el backend (localhost:8000).
+
+tailwind.config.ts
+  Configuración de Tailwind CSS: rutas de contenido, extensiones de tema.
+
+postcss.config.js
+  Plugins PostCSS necesarios para Tailwind (tailwindcss, autoprefixer).
+
+tsconfig.json / tsconfig.node.json
+  Configuraciones de TypeScript para la app y para las herramientas de build.
+
+index.html
+  HTML de entrada. Monta el div #root donde React renderiza.
+
+--- Estilos ---
+
+src/index.css
+  Estilos globales, directivas de Tailwind (@tailwind base/components/utilities).
+
+src/design-system.css
+  Variables CSS (design tokens): paleta de colores OXXO, tipografía, espaciados, sombras.
+
+--- Fuente ---
+
+src/main.tsx
+  Monta el componente <App /> en el DOM.
+
+src/App.tsx
+  Componente raíz; renderiza la página Home (actualmente app de una sola página).
+
+src/types/api.ts
+  Interfaces TypeScript que espejean los modelos Pydantic del backend:
+  UploadResponse, JobResult, ProductoResult, JobStatus.
+
+src/api/client.ts
+  Instancia de Axios con baseURL configurada. Exporta funciones:
+  uploadFile(), startOptimize(), getJobResult().
+
+src/hooks/useJobPolling.ts
+  Hook personalizado que hace polling a GET /api/optimize/result/{job_id} cada N ms
+  hasta que el job termina (status: done | error), actualizando el estado de React.
+
+--- Páginas ---
+
+src/pages/Home.tsx
+  Página principal y máquina de estados de la app:
+    idle → uploaded → running → done / error
+  Orquesta Uploader → ConfigPanel → disparo de optimización → PlanogramGrid / ScoreCard.
+
+src/pages/Result.tsx
+  Página de resultados detallados (referenciada en el router).
+
+--- Componentes principales ---
+
+src/components/Uploader.tsx
+  Zona de drag-and-drop para subir el CSV. Llama a uploadFile() y guarda el file_id.
+
+src/components/ConfigPanel.tsx
+  Formulario de parámetros de optimización (número de estantes, capacidad, etc.)
+  antes de disparar el job.
+
+src/components/PlanogramGrid.tsx
+  Cuadrícula visual que representa el planograma resultante: estantes × posiciones,
+  coloreado por categoría, con tooltips de producto.
+
+src/components/ScoreCard.tsx
+  Tarjeta resumen con métricas del resultado: score total, ocupación, distribución.
+
+--- Componentes UI reutilizables ---
+
+src/components/ui/Button.tsx    Botón con variantes (primary, secondary, danger).
+src/components/ui/Card.tsx      Contenedor con sombra y padding estándar.
+src/components/ui/Badge.tsx     Etiqueta pequeña para categorías o estados.
+src/components/ui/Skeleton.tsx  Placeholder animado durante carga.
+src/components/ui/Spinner.tsx   Indicador de carga circular.
+
+--- Assets ---
+
+public/logo_oxxo.png
+  Logo oficial de OXXO usado en la cabecera de la app.
+
+
+=======================
+DOCUMENTACIÓN  (/docs/)
+=======================
+
+docs/planogram-oxxo/bruno.json
+  Metadata de la colección Bruno (equivalente a Postman) para probar la API.
+
+docs/planogram-oxxo/environments/local.bru
+  Variables de entorno Bruno: base_url=http://localhost:8000, file_id, job_id.
+
+docs/planogram-oxxo/01-health-check.bru    GET /health
+docs/planogram-oxxo/02-upload-archivo.bru  POST /api/upload  (captura file_id automáticamente)
+docs/planogram-oxxo/03-optimizar.bru       POST /api/optimize (captura job_id automáticamente)
+docs/planogram-oxxo/04-ver-resultado.bru   GET /api/optimize/result/{job_id}
+
+docs/README.md
+  Guía de uso de la colección Bruno: cómo instalar Bruno y ejecutar las requests en orden.

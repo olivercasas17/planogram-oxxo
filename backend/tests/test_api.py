@@ -22,23 +22,14 @@ _CSV_PATH = pathlib.Path(__file__).parents[2] / "data" / "samples" / "ejemplo_pl
 # ---------------------------------------------------------------------------
 
 def _upload_csv() -> dict:
-    """POST the real CSV and return the parsed JSON response."""
     with _CSV_PATH.open("rb") as f:
         resp = client.post("/api/upload", files={"file": ("ejemplo_planograma.csv", f, "text/csv")})
     assert resp.status_code == 200, resp.text
     return resp.json()
 
 
-def _optimize(file_id: str, seg: str = "BCO", mue: str = "CF",
-              tam: float = 4.0, dir_: str = "ID") -> dict:
-    """POST /api/optimize and return the parsed JSON response."""
-    resp = client.post("/api/optimize", json={
-        "file_id": file_id,
-        "segmento_id": seg,
-        "mueble_id": mue,
-        "tamaño": tam,
-        "direccion": dir_,
-    })
+def _optimize(file_id: str) -> dict:
+    resp = client.post("/api/optimize", json={"file_id": file_id})
     assert resp.status_code == 200, resp.text
     return resp.json()
 
@@ -83,7 +74,6 @@ def test_health():
 class TestUpload:
 
     def test_status_200(self, upload_response):
-        # fixture already asserts 200; just confirm it reached here
         assert upload_response is not None
 
     def test_devuelve_file_id(self, upload_response):
@@ -94,27 +84,28 @@ class TestUpload:
     def test_devuelve_filename(self, upload_response):
         assert upload_response["filename"] == "ejemplo_planograma.csv"
 
-    def test_devuelve_configuraciones(self, upload_response):
-        assert "configuraciones" in upload_response
-        assert isinstance(upload_response["configuraciones"], list)
-        assert len(upload_response["configuraciones"]) > 0
+    def test_devuelve_total_productos(self, upload_response):
+        assert "total_productos" in upload_response
+        assert isinstance(upload_response["total_productos"], int)
+        assert upload_response["total_productos"] > 0
 
-    def test_configuracion_tiene_campos_requeridos(self, upload_response):
-        for cfg in upload_response["configuraciones"]:
-            assert "segmento_id" in cfg
-            assert "mueble_id" in cfg
-            assert "tamaño_post" in cfg
-            assert "direccion_lego_id" in cfg
+    def test_devuelve_tiendas_de_segmento_id(self, upload_response):
+        """tiendas debe contener valores de SEGMENTO_ID (BCO, CLA, HRN…), no CONJUNTO_ID."""
+        assert "tiendas" in upload_response
+        tiendas = upload_response["tiendas"]
+        assert isinstance(tiendas, list)
+        assert len(tiendas) > 0
+        assert all(isinstance(t, str) for t in tiendas)
+        # El CSV real tiene BCO, CLA, HRN — ningún valor de CONJUNTO_ID como 10MON
+        for t in tiendas:
+            assert t not in ("10MON", "RYX"), \
+                f"tiendas contiene CONJUNTO_ID '{t}' en lugar de SEGMENTO_ID"
 
-    def test_configuraciones_contiene_combinacion_esperada(self, upload_response):
-        combos = {
-            (c["segmento_id"], c["mueble_id"], c["tamaño_post"], c["direccion_lego_id"])
-            for c in upload_response["configuraciones"]
-        }
-        assert ("BCO", "CF", 4.0, "ID") in combos
+    def test_tiendas_ordenadas_alfabeticamente(self, upload_response):
+        tiendas = upload_response["tiendas"]
+        assert tiendas == sorted(tiendas)
 
     def test_csv_invalido_devuelve_422(self):
-        """Un archivo sin las columnas requeridas debe retornar 422."""
         bad_csv = b"col_a,col_b\n1,2\n"
         resp = client.post(
             "/api/upload",
@@ -145,18 +136,10 @@ class TestOptimize:
         assert len(optimize_response["job_id"]) > 0
 
     def test_status_inicial_pending(self, optimize_response):
-        # The response from POST is always "pending"
         assert optimize_response["status"] == "pending"
 
-    def test_file_id_invalido_no_bloquea_respuesta(self, upload_response):
-        """POST with an unknown file_id still returns 200 (job is async)."""
-        resp = client.post("/api/optimize", json={
-            "file_id": "no-existe",
-            "segmento_id": "BCO",
-            "mueble_id": "CF",
-            "tamaño": 4.0,
-            "direccion": "ID",
-        })
+    def test_file_id_invalido_no_bloquea_respuesta(self):
+        resp = client.post("/api/optimize", json={"file_id": "no-existe"})
         assert resp.status_code == 200
         assert resp.json()["status"] == "pending"
 
@@ -172,11 +155,7 @@ class TestOptimize:
 
 class TestJobResult:
 
-    def test_status_200(self, job_result):
-        assert job_result is not None
-
     def test_status_done(self, job_result):
-        # BackgroundTasks run synchronously inside TestClient
         assert job_result["status"] == "done"
 
     def test_tiene_job_id(self, job_result):
@@ -184,53 +163,71 @@ class TestJobResult:
         assert isinstance(job_result["job_id"], str)
 
     def test_tiene_solver(self, job_result):
-        assert job_result.get("solver") == "toy_greedy_v1"
+        assert job_result.get("solver") == "heuristico_v1"
 
     def test_score_entre_0_y_1(self, job_result):
         score = job_result.get("score")
         assert score is not None
         assert 0.0 <= score <= 1.0
 
+    def test_score_alto_en_modo_imitacion(self, job_result):
+        """En modo imitación (factor_ancho=1.0) el score debe ser ≥ 0.95."""
+        assert job_result["score"] >= 0.95
+
     def test_tiene_results(self, job_result):
         assert "results" in job_result
         assert isinstance(job_result["results"], list)
+        assert len(job_result["results"]) > 0
 
     def test_totales_presentes(self, job_result):
-        assert "total_planogrupos" in job_result
-        assert "asignados" in job_result
-        assert "sin_asignar" in job_result
+        assert "total_productos" in job_result
+        assert "colocados" in job_result
+        assert "no_colocados" in job_result
 
     def test_totales_consistentes(self, job_result):
-        total = job_result["total_planogrupos"]
-        asig = job_result["asignados"]
-        sin = job_result["sin_asignar"]
-        assert asig + sin == total
+        total    = job_result["total_productos"]
+        colocados = job_result["colocados"]
+        no_col   = job_result["no_colocados"]
+        assert colocados + no_col == total
         assert total == len(job_result["results"])
 
     def test_cada_result_tiene_campos_requeridos(self, job_result):
         for item in job_result["results"]:
-            assert "planogrupo" in item
-            assert "charola" in item
-            assert "ubicacion_bandeja" in item
-            assert "ancho_usado_cm" in item
+            for campo in ("mueble_id", "planogrupo", "num_frentes",
+                          "ancho_cm", "alto_cm", "ancho_ocupado_cm",
+                          "flag_no_colocado"):
+                assert campo in item, f"Falta campo '{campo}' en ProductoResult"
 
-    def test_charola_es_int(self, job_result):
+    def test_segmento_id_presente_en_results(self, job_result):
+        """segmento_id debe venir en cada ProductoResult para el filtro del frontend."""
         for item in job_result["results"]:
-            assert isinstance(item["charola"], int)
+            assert "segmento_id" in item
 
-    def test_ubicacion_bandeja_es_int(self, job_result):
+    def test_direccion_presente_en_results(self, job_result):
+        """direccion debe venir en cada ProductoResult para el makeKey del dropdown."""
         for item in job_result["results"]:
-            assert isinstance(item["ubicacion_bandeja"], int)
+            assert "direccion" in item
 
-    def test_job_invalido_devuelve_error_done(self):
-        """A job launched with a bad file_id should end in 'error' status."""
-        resp = client.post("/api/optimize", json={
-            "file_id": "no-existe",
-            "segmento_id": "BCO",
-            "mueble_id": "CF",
-            "tamaño": 4.0,
-            "direccion": "ID",
-        })
+    def test_charola_int_o_none(self, job_result):
+        for item in job_result["results"]:
+            assert item["charola"] is None or isinstance(item["charola"], int)
+
+    def test_ubicacion_bandeja_int_o_none(self, job_result):
+        for item in job_result["results"]:
+            assert item["ubicacion_bandeja"] is None or isinstance(item["ubicacion_bandeja"], int)
+
+    def test_ninguna_charola_excede_ancho(self, job_result):
+        """Restricción crítica: ninguna charola debe exceder 55 cm."""
+        assert job_result.get("charolas_exceden_ancho") == 0, \
+            f"charolas_exceden_ancho={job_result.get('charolas_exceden_ancho')}"
+
+    def test_sin_posiciones_duplicadas(self, job_result):
+        """No debe haber dos productos en la misma (charola, ubicacion_bandeja)."""
+        assert job_result.get("posiciones_duplicadas") == 0, \
+            f"posiciones_duplicadas={job_result.get('posiciones_duplicadas')}"
+
+    def test_job_invalido_termina_en_error(self):
+        resp = client.post("/api/optimize", json={"file_id": "no-existe"})
         bad_job_id = resp.json()["job_id"]
         result = client.get(f"/api/optimize/result/{bad_job_id}")
         assert result.status_code == 200
